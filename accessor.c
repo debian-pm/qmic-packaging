@@ -1,106 +1,102 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
+
 #include "qmic.h"
 
-static const char *sz_simple_types[] = {
-	[TYPE_U8] = "uint8_t",
-	[TYPE_U16] = "uint16_t",
-	[TYPE_U32] = "uint32_t",
-	[TYPE_U64] = "uint64_t",
-};
-
-struct qmi_message_member {
-	const char *name;
-	int type;
-	struct qmi_struct *qmi_struct;
-	int id;
-	bool required;
-	unsigned array;
-
-	struct qmi_message_member *next;
-};
-
-struct qmi_message {
-	enum message_type type;
-	const char *name;
-	unsigned msg_id;
-
-	struct qmi_message *next;
-
-	LIST_HEAD(qmi_message_member, members);
-};
-
-LIST_HEAD(qmi_message, qmi_messages);
-
-void qmi_message_parse(enum message_type message_type)
+static void qmi_struct_header(FILE *fp, const char *package)
 {
-	struct qmi_message_member *qmm;
-	struct qmi_message *qm;
-	struct token msg_id_tok;
-	struct token type_tok;
-	struct token num_tok;
-	struct token id_tok;
-	unsigned array;
-	bool required;
+	struct qmi_struct_member *qsm;
+	struct qmi_struct *qs;
 
-	token_expect(TOK_ID, &msg_id_tok);
-	token_expect('{', NULL);
-
-	qm = malloc(sizeof(struct qmi_message));
-	qm->name = msg_id_tok.str;
-	qm->type = message_type;
-
-	while (!token_accept('}', NULL)) {
-		array = 0;
-
-		if (token_accept(TOK_REQUIRED, NULL))
-			required = true;
-		else if (token_accept(TOK_OPTIONAL, NULL))
-			required = false;
-		else
-			yyerror("expected required, optional or '}'");
-
-		token_expect(TOK_TYPE, &type_tok);
-		token_expect(TOK_ID, &id_tok);
-
-		if (token_accept('[', NULL)) {
-			array = 1;
-			if (token_accept(TOK_NUM, &num_tok)) {
-				if (num_tok.num & 0xffff0000)
-					array = 4;
-				else if (num_tok.num & 0xff00)
-					array = 2;
-			}
-
-			token_expect(']', NULL);
+	list_for_each_entry(qs, &qmi_structs, node) {
+		fprintf(fp, "struct %s_%s {\n",
+			    package, qs->name);
+		list_for_each_entry(qsm, &qs->members, node) {
+			fprintf(fp, "\t%s %s;\n",
+				    sz_simple_types[qsm->type], qsm->name);
 		}
-
-		token_expect('=', NULL);
-		token_expect(TOK_NUM, &num_tok);
-		token_expect(';', NULL);
-
-		qmm = malloc(sizeof(struct qmi_message_member));
-		qmm->name = id_tok.str;
-		qmm->type = type_tok.num;
-		qmm->qmi_struct = type_tok.qmi_struct;
-		qmm->id = num_tok.num;
-		qmm->required = required;
-		qmm->array = array;
-
-		LIST_ADD(qm->members, qmm);
+		fprintf(fp, "};\n"
+			    "\n");
 	}
+}
 
-	if (token_accept('=', NULL)) {
-		token_expect(TOK_NUM, &num_tok);
+static void qmi_struct_emit_prototype(FILE *fp,
+			       const char *package,
+			       const char *message,
+			       const char *member,
+			       unsigned array_size,
+			       struct qmi_struct *qs)
+{
+	if (array_size) {
+		fprintf(fp, "int %1$s_%2$s_set_%3$s(struct %1$s_%2$s *%2$s, struct %1$s_%4$s *val, size_t count);\n",
+			    package, message, member, qs->name);
 
-		qm->msg_id = num_tok.num;
+		fprintf(fp, "struct %1$s_%4$s *%1$s_%2$s_get_%3$s(struct %1$s_%2$s *%2$s, size_t *count);\n\n",
+			    package, message, member, qs->name);
+	} else {
+		fprintf(fp, "int %1$s_%2$s_set_%3$s(struct %1$s_%2$s *%2$s, struct %1$s_%4$s *val);\n",
+			    package, message, member, qs->name);
+
+		fprintf(fp, "struct %1$s_%4$s *%1$s_%2$s_get_%3$s(struct %1$s_%2$s *%2$s);\n\n",
+			    package, message, member, qs->name);
 	}
+}
 
-	token_expect(';', NULL);
+static void qmi_struct_emit_accessors(FILE *fp,
+			       const char *package,
+			       const char *message,
+			       const char *member,
+			       int member_id,
+			       unsigned array_size,
+			       struct qmi_struct *qs)
+{
+	if (array_size) {
+		fprintf(fp, "int %1$s_%2$s_set_%3$s(struct %1$s_%2$s *%2$s, struct %1$s_%4$s *val, size_t count)\n"
+			    "{\n"
+			    "	return qmi_tlv_set_array((struct qmi_tlv*)%2$s, %5$d, %6$d, val, count, sizeof(struct %1$s_%4$s));\n"
+			    "}\n\n",
+			    package, message, member, qs->name, member_id, array_size);
 
-	LIST_ADD(qmi_messages, qm);
+		fprintf(fp, "struct %1$s_%4$s *%1$s_%2$s_get_%3$s(struct %1$s_%2$s *%2$s, size_t *count)\n"
+			    "{\n"
+			    "	size_t size;\n"
+			    "	size_t len;\n"
+			    "	void *ptr;\n"
+			    "\n"
+			    "	ptr = qmi_tlv_get_array((struct qmi_tlv*)%2$s, %5$d, %6$d, &len, &size);\n"
+			    "	if (!ptr)\n"
+			    "		return NULL;\n"
+			    "\n"
+			    "	if (size != sizeof(struct %1$s_%4$s))\n"
+			    "		return NULL;\n"
+			    "\n"
+			    "	*count = len;\n"
+			    "	return ptr;\n"
+			    "}\n\n",
+			    package, message, member, qs->name, member_id, array_size);
+	} else {
+		fprintf(fp, "int %1$s_%2$s_set_%3$s(struct %1$s_%2$s *%2$s, struct %1$s_%4$s *val)\n"
+			    "{\n"
+			    "	return qmi_tlv_set((struct qmi_tlv*)%2$s, %5$d, val, sizeof(struct %1$s_%4$s));\n"
+			    "}\n\n",
+			    package, message, member, qs->name, member_id);
+
+		fprintf(fp, "struct %1$s_%4$s *%1$s_%2$s_get_%3$s(struct %1$s_%2$s *%2$s)\n"
+			    "{\n"
+			    "	size_t len;\n"
+			    "	void *ptr;\n"
+			    "\n"
+			    "	ptr = qmi_tlv_get((struct qmi_tlv*)%2$s, %5$d, &len);\n"
+			    "	if (!ptr)\n"
+			    "		return NULL;\n"
+			    "\n"
+			    "	if (len != sizeof(struct %1$s_%4$s))\n"
+			    "		return NULL;\n"
+			    "\n"
+			    "	return ptr;\n"
+			    "}\n\n",
+			    package, message, member, qs->name, member_id);
+	}
 }
 
 static void qmi_message_emit_message_type(FILE *fp,
@@ -166,7 +162,7 @@ static void qmi_message_emit_simple_prototype(FILE *fp,
 					      const char *message,
 					      struct qmi_message_member *qmm)
 {
-	if (qmm->array) {
+	if (qmm->array_size) {
 		fprintf(fp, "int %1$s_%2$s_set_%3$s(struct %1$s_%2$s *%2$s, %4$s *val, size_t count);\n",
 			    package, message, qmm->name, sz_simple_types[qmm->type]);
 
@@ -187,12 +183,12 @@ static void qmi_message_emit_simple_accessors(FILE *fp,
 					      const char *message,
 					      struct qmi_message_member *qmm)
 {
-	if (qmm->array) {
+	if (qmm->array_size) {
 		fprintf(fp, "int %1$s_%2$s_set_%3$s(struct %1$s_%2$s *%2$s, %4$s *val, size_t count)\n"
 			    "{\n"
 			    "	return qmi_tlv_set_array((struct qmi_tlv*)%2$s, %5$d, %6$d, val, count, sizeof(%4$s));\n"
 			    "}\n\n",
-			    package, message, qmm->name, sz_simple_types[qmm->type], qmm->id, qmm->array);
+			    package, message, qmm->name, sz_simple_types[qmm->type], qmm->id, qmm->array_size);
 
 		fprintf(fp, "%4$s *%1$s_%2$s_get_%3$s(struct %1$s_%2$s *%2$s, size_t *count)\n"
 			    "{\n"
@@ -210,7 +206,7 @@ static void qmi_message_emit_simple_accessors(FILE *fp,
 			    "	*count = len;\n"
 			    "	return ptr;\n"
 			    "}\n\n",
-			    package, message, qmm->name, sz_simple_types[qmm->type], qmm->id, qmm->array);
+			    package, message, qmm->name, sz_simple_types[qmm->type], qmm->id, qmm->array_size);
 	} else {
 		fprintf(fp, "int %1$s_%2$s_set_%3$s(struct %1$s_%2$s *%2$s, %4$s val)\n"
 			    "{\n"
@@ -242,7 +238,7 @@ static void qmi_message_emit_string_prototype(FILE *fp,
 					      const char *message,
 					      struct qmi_message_member *qmm)
 {
-	if (qmm->array) {
+	if (qmm->array_size) {
 		fprintf(stderr, "Dont' know how to encode string arrays yet");
 		exit(1);
 	} else {
@@ -285,15 +281,15 @@ static void qmi_message_emit_string_accessors(FILE *fp,
 
 }
 
-void qmi_message_source(FILE *fp, const char *package)
+static void qmi_message_source(FILE *fp, const char *package)
 {
 	struct qmi_message_member *qmm;
 	struct qmi_message *qm;
 
-	for (qm = qmi_messages.head; qm; qm = qm->next) {
+	list_for_each_entry(qm, &qmi_messages, node) {
 		qmi_message_emit_message(fp, package, qm);
 
-		for (qmm = qm->members.head; qmm; qmm = qmm->next)
+		list_for_each_entry(qmm, &qm->members, node) {
 			switch (qmm->type) {
 			case TYPE_U8:
 			case TYPE_U16:
@@ -305,26 +301,27 @@ void qmi_message_source(FILE *fp, const char *package)
 				qmi_message_emit_string_accessors(fp, package, qm->name, qmm);
 				break;
 			case TYPE_STRUCT:
-				qmi_struct_emit_accessors(fp, package, qm->name, qmm->name, qmm->id, qmm->array, qmm->qmi_struct);
+				qmi_struct_emit_accessors(fp, package, qm->name, qmm->name, qmm->id, qmm->array_size, qmm->qmi_struct);
 				break;
 			};
+		}
 	}
 }
 
-void qmi_message_header(FILE *fp, const char *package)
+static void qmi_message_header(FILE *fp, const char *package)
 {
 	struct qmi_message_member *qmm;
 	struct qmi_message *qm;
 
-	for (qm = qmi_messages.head; qm; qm = qm->next)
+	list_for_each_entry(qm, &qmi_messages, node)
 		qmi_message_emit_message_type(fp, package, qm->name);
 
 	fprintf(fp, "\n");
 
-	for (qm = qmi_messages.head; qm; qm = qm->next) {
+	list_for_each_entry(qm, &qmi_messages, node) {
 		qmi_message_emit_message_prototype(fp, package, qm->name);
 
-		for (qmm = qm->members.head; qmm; qmm = qmm->next) {
+		list_for_each_entry(qmm, &qm->members, node) {
 			switch (qmm->type) {
 			case TYPE_U8:
 			case TYPE_U16:
@@ -336,9 +333,43 @@ void qmi_message_header(FILE *fp, const char *package)
 				qmi_message_emit_string_prototype(fp, package, qm->name, qmm);
 				break;
 			case TYPE_STRUCT:
-				qmi_struct_emit_prototype(fp, package, qm->name, qmm->name, qmm->array, qmm->qmi_struct);
+				qmi_struct_emit_prototype(fp, package, qm->name, qmm->name, qmm->array_size, qmm->qmi_struct);
 				break;
 			};
 		}
 	}
+}
+
+static void emit_header_file_header(FILE *fp)
+{
+	fprintf(fp, "#include <stdint.h>\n"
+		    "#include <stdlib.h>\n\n");
+	fprintf(fp, "struct qmi_tlv;\n"
+		    "\n"
+		    "struct qmi_tlv *qmi_tlv_init(unsigned txn, unsigned msg_id, unsigned type);\n"
+		    "struct qmi_tlv *qmi_tlv_decode(void *buf, size_t len, unsigned *txn, unsigned type);\n"
+		    "void *qmi_tlv_encode(struct qmi_tlv *tlv, size_t *len);\n"
+		    "void qmi_tlv_free(struct qmi_tlv *tlv);\n"
+		    "\n"
+		    "void *qmi_tlv_get(struct qmi_tlv *tlv, unsigned id, size_t *len);\n"
+		    "void *qmi_tlv_get_array(struct qmi_tlv *tlv, unsigned id, unsigned len_size, size_t *len, size_t *size);\n"
+		    "int qmi_tlv_set(struct qmi_tlv *tlv, unsigned id, void *buf, size_t len);\n"
+		    "int qmi_tlv_set_array(struct qmi_tlv *tlv, unsigned id, unsigned len_size, void *buf, size_t len, size_t size);\n"
+		    "\n");
+}
+
+void accessor_emit_c(FILE *fp, const char *package)
+{
+	emit_source_includes(fp, package);
+	qmi_message_source(fp, package);
+}
+	
+void accessor_emit_h(FILE *fp, const char *package)
+{
+	guard_header(fp, qmi_package);
+	emit_header_file_header(fp);
+	qmi_const_header(fp);
+	qmi_struct_header(fp, qmi_package);
+	qmi_message_header(fp, qmi_package);
+	guard_footer(fp);
 }
