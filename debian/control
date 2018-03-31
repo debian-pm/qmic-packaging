@@ -10,6 +10,7 @@ Vcs-Browser: https://github.com/debian-pm/qmic-packaging
 
 Package: qmic
 Architecture: any
+Multi-Arch: foreign
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: QMI Compiler
  QMI compiler.
